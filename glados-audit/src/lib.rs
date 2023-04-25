@@ -12,7 +12,7 @@ use cli::Args;
 use ethportal_api::{HistoryContentKey, OverlayContentKey};
 use sea_orm::DatabaseConnection;
 use tokio::{
-    sync::mpsc::{self, Receiver},
+    sync::mpsc::{self, error::TryRecvError, Receiver},
     time::{sleep, Duration},
 };
 use tracing::{debug, error, info};
@@ -165,7 +165,10 @@ async fn start_collation(
                         .send(task)
                         .await
                         .expect("Unable to collate task"),
-                    Err(_) => break,
+                    Err(TryRecvError::Empty) => break,
+                    Err(TryRecvError::Disconnected) => {
+                        panic!("Unable to receive task for collation")
+                    }
                 }
             }
         }
