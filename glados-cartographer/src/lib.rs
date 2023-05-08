@@ -7,9 +7,9 @@ use ethportal_api::HistoryNetworkApiClient;
 use ethportal_api::{
     jsonrpsee::http_client::HttpClientBuilder, types::discv5::NodeId as EthPortalNodeId,
 };
+use primitive_types::U256;
 use sea_orm::DatabaseConnection;
-use trin_types::node_id::NodeId;
-use std::collections::hash_set::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use std::time::Duration as StdDuration;
 use tokio::{
@@ -20,8 +20,9 @@ use tokio::{
     time,
 };
 use tracing::{debug, error, info};
+use trin_types::{enr::Enr, node_id::NodeId};
 
-use entity::record;
+use entity::{census, census_node, record};
 use glados_core::jsonrpc::TransportConfig;
 
 use crate::cli::TransportType;
@@ -88,12 +89,19 @@ async fn orchestrate_dht_census(config: CartographerConfig, conn: DatabaseConnec
     }
 }
 
+struct DHTCensusRecord {
+    enr: Enr,
+    record_id: i32,
+    data_radius: U256,
+    surveyed_at: DateTime<Utc>,
+}
+
 struct DHTCensus {
     known: RwLock<HashSet<[u8; 32]>>,
-    alive: RwLock<HashSet<[u8; 32]>>,
+    pub alive: RwLock<HashMap<[u8; 32], DHTCensusRecord>>,
     finished: RwLock<HashSet<[u8; 32]>>,
     errored: RwLock<HashSet<[u8; 32]>>,
-    started_at: DateTime<Utc>,
+    pub started_at: DateTime<Utc>,
 }
 
 struct DHTCensusStats {
@@ -109,7 +117,7 @@ struct DHTCensusStats {
 impl DHTCensus {
     fn new() -> Self {
         let known: RwLock<HashSet<[u8; 32]>> = RwLock::new(HashSet::new());
-        let alive: RwLock<HashSet<[u8; 32]>> = RwLock::new(HashSet::new());
+        let alive: RwLock<HashMap<[u8; 32], DHTCensusRecord>> = RwLock::new(HashMap::new());
         let finished: RwLock<HashSet<[u8; 32]>> = RwLock::new(HashSet::new());
         let errored: RwLock<HashSet<[u8; 32]>> = RwLock::new(HashSet::new());
 
@@ -173,9 +181,18 @@ impl DHTCensus {
         known.insert(node_id.0)
     }
 
-    async fn add_alive(&self, node_id: NodeId) -> bool {
+    async fn add_alive(&self, enr: Enr, record_id: i32, data_radius: U256) {
+        if self.alive.read().await.contains_key(&enr.node_id().raw()) {
+            return;
+        }
+        let census_record = DHTCensusRecord {
+            enr,
+            record_id,
+            data_radius,
+            surveyed_at: Utc::now(),
+        };
         let mut alive = self.alive.write().await;
-        alive.insert(node_id.0)
+        alive.insert(census_record.enr.node_id().raw(), census_record);
     }
 
     async fn add_finished(&self, node_id: NodeId) -> bool {
@@ -203,17 +220,7 @@ async fn perform_dht_census(config: CartographerConfig, conn: DatabaseConnection
         TransportConfig::IPC(_path) => panic!("not implemented"),
     };
 
-
-    info!(
-        origin.node_id=?H256::from(target.raw()),
-        "Starting DHT census",
-    );
-
-    let found_enrs = client
-        .recursive_find_nodes(EthPortalNodeId(target.raw()))
-        .await
-        .unwrap();
-
+    let target = NodeId::random();
     let census = Arc::new(DHTCensus::new());
 
     // Initial un-processed ENRs to be pinged
@@ -222,8 +229,16 @@ async fn perform_dht_census(config: CartographerConfig, conn: DatabaseConnection
     // ENRs that have been pinged and now need to have their routing tables enumerated
     let (to_enumerate_tx, to_enumerate_rx): (Sender<Enr>, Receiver<Enr>) = mpsc::channel(256);
 
+    info!(
+        target.node_id=?H256::from(target.raw()),
+        "Starting DHT census",
+    );
+
     // Initialize our search with a random-ish set of ENRs
-    let initial_enrs = client.recursive_find_nodes(origin).await.unwrap();
+    let initial_enrs = client
+        .recursive_find_nodes(EthPortalNodeId(target.raw()))
+        .await
+        .unwrap();
     for enr in initial_enrs {
         census.add_known(NodeId(enr.node_id().raw())).await;
         to_ping_tx.send(enr).await.unwrap();
@@ -283,6 +298,27 @@ async fn perform_dht_census(config: CartographerConfig, conn: DatabaseConnection
     debug!("Waiting for channels to exit");
     ping_handle.abort();
     enumerate_handle.abort();
+
+    let census_model = census::create(
+        census.started_at,
+        census.duration().num_seconds().try_into().unwrap(),
+        &conn,
+    )
+    .await
+    .unwrap();
+
+    for (_, census_record) in census.alive.read().await.iter() {
+        census_node::create(
+            census_model.id,
+            census_record.record_id,
+            census_record.data_radius,
+            census_record.surveyed_at,
+            &conn,
+        )
+        .await
+        .expect("Unable to save census node record");
+    }
+
     info!("Census finished");
 }
 
@@ -329,22 +365,28 @@ async fn do_liveliness_check(
     };
 
     // Save record to database
-    match record::get_or_create(&enr, &conn).await {
-        Ok(_) => debug!(enr.base64 = enr.to_base64(), "Saved ENR"),
-        Err(err) => {
-            error!(enr.node_id=?H256::from(enr.node_id().raw()), err=?err, "Error saving ENR to database")
+    let record_model = match record::get_or_create(&enr, &conn).await {
+        Ok(record_model) => {
+            debug!(enr.base64 = enr.to_base64(), "Saved ENR");
+            record_model
         }
-    }
+        Err(err) => {
+            error!(enr.node_id=?H256::from(enr.node_id().raw()), err=?err, "Error saving ENR to database");
+            return;
+        }
+    };
 
     // Perform liviliness check
     debug!(node_id=?H256::from(enr.node_id().raw()), "Liveliness check");
 
     match client.ping(enr.to_owned(), None).await {
-        Ok(_pong_info) => {
+        Ok(pong_info) => {
             debug!(node_id=?H256::from(enr.node_id().raw()), "Liveliness passed");
 
             // Mark node as known to be alive
-            census.add_alive(NodeId(enr.node_id().raw())).await;
+            census
+                .add_alive(enr.clone(), record_model.id, pong_info.data_radius)
+                .await;
 
             // Send enr to process that enumerates it's routing table
             tx.send(enr).await.unwrap();
