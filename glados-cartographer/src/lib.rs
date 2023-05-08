@@ -15,7 +15,7 @@ use std::time::Duration as StdDuration;
 use tokio::{
     sync::{
         mpsc::{self, Receiver, Sender},
-        OwnedSemaphorePermit, RwLock, Semaphore,
+        RwLock, Semaphore,
     },
     time,
 };
@@ -338,14 +338,17 @@ async fn orchestrate_liveliness_checks(
             .acquire_owned()
             .await
             .expect("Unable to acquire permit");
-        tokio::spawn(do_liveliness_check(
+        let handle = do_liveliness_check(
             enr,
             tx.clone(),
             census.clone(),
             config.clone(),
             conn.clone(),
-            permit,
-        ));
+        );
+        tokio::spawn(async move {
+            handle.await;
+            drop(permit);
+        });
     }
 }
 
@@ -355,7 +358,6 @@ async fn do_liveliness_check(
     census: Arc<DHTCensus>,
     config: CartographerConfig,
     conn: DatabaseConnection,
-    permit: OwnedSemaphorePermit,
 ) {
     let client = match config.transport {
         TransportConfig::HTTP(http_url) => HttpClientBuilder::default()
@@ -398,8 +400,6 @@ async fn do_liveliness_check(
             census.add_errored(NodeId(enr.node_id().raw())).await;
         }
     }
-
-    drop(permit);
 }
 
 async fn orchestrate_routing_table_enumerations(
@@ -415,13 +415,11 @@ async fn orchestrate_routing_table_enumerations(
             .acquire_owned()
             .await
             .expect("Unable to acquire permit");
-        tokio::spawn(do_routing_table_enumeration(
-            enr,
-            tx.clone(),
-            census.clone(),
-            config.clone(),
-            permit,
-        ));
+        let handle = do_routing_table_enumeration(enr, tx.clone(), census.clone(), config.clone());
+        tokio::spawn(async move {
+            handle.await;
+            drop(permit);
+        });
     }
 }
 
@@ -430,7 +428,6 @@ async fn do_routing_table_enumeration(
     tx: mpsc::Sender<Enr>,
     census: Arc<DHTCensus>,
     config: CartographerConfig,
-    permit: OwnedSemaphorePermit,
 ) {
     let client = match config.transport {
         TransportConfig::HTTP(http_url) => HttpClientBuilder::default()
@@ -462,6 +459,4 @@ async fn do_routing_table_enumeration(
         }
     }
     census.add_finished(NodeId(enr.node_id().raw())).await;
-
-    drop(permit);
 }
