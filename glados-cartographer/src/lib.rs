@@ -414,6 +414,7 @@ async fn do_liveliness_check(
                 Ok(client) => client,
                 Err(err) => {
                     error!(client.http_url=?http_url, err=?err, "Error initializing Portal JSON-RPC HTTP client");
+                    census.add_errored(NodeId(enr.node_id().raw())).await;
                     return;
                 }
             }
@@ -429,6 +430,7 @@ async fn do_liveliness_check(
         }
         Err(err) => {
             error!(enr.node_id=?H256::from(enr.node_id().raw()), err=?err, "Error saving ENR to database");
+            census.add_errored(NodeId(enr.node_id().raw())).await;
             return;
         }
     };
@@ -446,9 +448,12 @@ async fn do_liveliness_check(
                 .await;
 
             // Send enr to process that enumerates it's routing table
-            match tx.send(enr).await {
+            match tx.send(enr.clone()).await {
                 Ok(_) => (),
-                Err(err) => error!(err=?err, "Error queueing enr for routing table enumeration"),
+                Err(err) => {
+                    error!(err=?err, "Error queueing enr for routing table enumeration");
+                    census.add_finished(NodeId(enr.node_id().raw())).await;
+                }
             }
         }
         Err(err) => {
@@ -493,6 +498,7 @@ async fn do_routing_table_enumeration(
                 Ok(client) => client,
                 Err(err) => {
                     error!(client.http_url=?http_url, err=?err, "Error initializing Portal JSON-RPC HTTP client");
+                    census.add_errored(NodeId(enr.node_id().raw())).await;
                     return;
                 }
             }
@@ -506,11 +512,11 @@ async fn do_routing_table_enumeration(
         let enrs_at_distance = match client.find_nodes(enr.to_owned(), vec![distance]).await {
             Ok(result) => result,
             Err(msg) => {
-                debug!(enr.node_id=?H256::from(enr.node_id().raw()), msg=?msg, "Error fetching routing table info");
+                warn!(enr.node_id=?H256::from(enr.node_id().raw()), distance=?distance, msg=?msg, "Error fetching routing table info");
                 continue;
             }
         };
-        debug!(enr.node_id=?H256::from(enr.node_id().raw()), distance=distance, total=enrs_at_distance.total, count=enrs_at_distance.enrs.len(), "Routing Table Info");
+        debug!(enr.node_id=?H256::from(enr.node_id().raw()), distance=distance, count=enrs_at_distance.enrs.len(), "Routing Table Info");
         for found_enr in enrs_at_distance.enrs {
             if census.is_known(NodeId(found_enr.node_id().raw())).await {
                 continue;
