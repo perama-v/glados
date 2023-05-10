@@ -19,7 +19,7 @@ use tokio::{
     },
     time,
 };
-use tracing::{debug, error, info};
+use tracing::{debug, error, info, warn};
 use trin_types::{enr::Enr, node_id::NodeId};
 
 use entity::{census, census_node, record};
@@ -157,7 +157,7 @@ impl DHTCensus {
         let duration = self.duration();
 
         let requests_per_second = (alive + finished + errored)
-            .checked_div(duration.num_seconds().try_into().unwrap())
+            .checked_div(duration.num_seconds().try_into().unwrap()) // should always fit into usize
             .unwrap_or(0);
 
         DHTCensusStats {
@@ -214,9 +214,18 @@ impl DHTCensus {
 /// 4. Track all seen node-ids until we find no new ones.
 async fn perform_dht_census(config: CartographerConfig, conn: DatabaseConnection) {
     let client = match &config.transport {
-        TransportConfig::HTTP(http_url) => HttpClientBuilder::default()
-            .build(http_url.as_ref())
-            .unwrap(),
+        TransportConfig::HTTP(http_url) => {
+            match HttpClientBuilder::default().build(http_url.as_ref()) {
+                Ok(client) => {
+                    debug!(client.http_url=?http_url, "Portal JSON-RPC HTTP client initialized");
+                    client
+                }
+                Err(err) => {
+                    error!(client.http_url=?http_url, err=?err, "Error initializing Portal JSON-RPC HTTP client");
+                    return;
+                }
+            }
+        }
         TransportConfig::IPC(_path) => panic!("not implemented"),
     };
 
@@ -235,20 +244,33 @@ async fn perform_dht_census(config: CartographerConfig, conn: DatabaseConnection
     );
 
     // Initialize our search with a random-ish set of ENRs
-    let initial_enrs = client
+    let initial_enrs = match client
         .recursive_find_nodes(EthPortalNodeId(target.raw()))
         .await
-        .unwrap();
+    {
+        Ok(initial_enrs) => initial_enrs,
+        Err(err) => {
+            error!(target.node_id=?H256::from(target.raw()), err=?err, "Error during census initialization");
+            return;
+        }
+    };
+
     for enr in initial_enrs {
         census.add_known(NodeId(enr.node_id().raw())).await;
-        to_ping_tx.send(enr).await.unwrap();
+        match to_ping_tx.send(enr).await {
+            Ok(_) => (),
+            Err(err) => {
+                error!(err=?err, "Error during census initialization");
+                return;
+            }
+        };
     }
 
     let limiter = Arc::new(Semaphore::new(config.concurrency));
 
     let ping_handle = tokio::task::spawn(orchestrate_liveliness_checks(
         to_ping_rx,
-        to_enumerate_tx,
+        to_enumerate_tx.clone(),
         census.clone(),
         config.to_owned(),
         conn.to_owned(),
@@ -256,7 +278,7 @@ async fn perform_dht_census(config: CartographerConfig, conn: DatabaseConnection
     ));
     let enumerate_handle = tokio::task::spawn(orchestrate_routing_table_enumerations(
         to_enumerate_rx,
-        to_ping_tx,
+        to_ping_tx.clone(),
         census.clone(),
         config.to_owned(),
         limiter.clone(),
@@ -293,22 +315,35 @@ async fn perform_dht_census(config: CartographerConfig, conn: DatabaseConnection
             );
             break;
         }
+
+        if to_ping_tx.is_closed() {
+            warn!("The `to_ping_tx` channel is closed");
+        }
+        if to_enumerate_tx.is_closed() {
+            warn!("The `to_enumerate_tx` channel is closed");
+        }
     }
 
     debug!("Waiting for channels to exit");
     ping_handle.abort();
     enumerate_handle.abort();
 
-    let census_model = census::create(
+    let census_model = match census::create(
         census.started_at,
-        census.duration().num_seconds().try_into().unwrap(),
+        census.duration().num_seconds().try_into().unwrap(), // should always fit into u32
         &conn,
     )
     .await
-    .unwrap();
+    {
+        Ok(census_model) => census_model,
+        Err(err) => {
+            error!(err=?err, "Error saving census model to database");
+            return;
+        }
+    };
 
     for (_, census_record) in census.alive.read().await.iter() {
-        census_node::create(
+        match census_node::create(
             census_model.id,
             census_record.record_id,
             census_record.data_radius,
@@ -316,7 +351,21 @@ async fn perform_dht_census(config: CartographerConfig, conn: DatabaseConnection
             &conn,
         )
         .await
-        .expect("Unable to save census node record");
+        {
+            Ok(census_node_model) => debug!(
+                census.id = census_model.id,
+                census.node.id = census_node_model.id,
+                "Saved new census_node record"
+            ),
+            Err(err) => error!(
+                census.id=census_model.id,
+                census_node.record_id=census_record.record_id,
+                census_node.data_radius=?census_record.data_radius,
+                census_node.surveyed_at=?census_record.surveyed_at,
+                err=?err,
+                "Error saving new census_node record"
+            ),
+        };
     }
 
     info!("Census finished");
@@ -360,9 +409,15 @@ async fn do_liveliness_check(
     conn: DatabaseConnection,
 ) {
     let client = match config.transport {
-        TransportConfig::HTTP(http_url) => HttpClientBuilder::default()
-            .build(http_url.as_ref())
-            .unwrap(),
+        TransportConfig::HTTP(http_url) => {
+            match HttpClientBuilder::default().build(http_url.as_ref()) {
+                Ok(client) => client,
+                Err(err) => {
+                    error!(client.http_url=?http_url, err=?err, "Error initializing Portal JSON-RPC HTTP client");
+                    return;
+                }
+            }
+        }
         TransportConfig::IPC(_path) => panic!("not implemented"),
     };
 
@@ -391,7 +446,10 @@ async fn do_liveliness_check(
                 .await;
 
             // Send enr to process that enumerates it's routing table
-            tx.send(enr).await.unwrap();
+            match tx.send(enr).await {
+                Ok(_) => (),
+                Err(err) => error!(err=?err, "Error queueing enr for routing table enumeration"),
+            }
         }
         Err(err) => {
             debug!(node_id=?H256::from(enr.node_id().raw()), err=?err, "Liveliness failed");
@@ -430,9 +488,15 @@ async fn do_routing_table_enumeration(
     config: CartographerConfig,
 ) {
     let client = match config.transport {
-        TransportConfig::HTTP(http_url) => HttpClientBuilder::default()
-            .build(http_url.as_ref())
-            .unwrap(),
+        TransportConfig::HTTP(http_url) => {
+            match HttpClientBuilder::default().build(http_url.as_ref()) {
+                Ok(client) => client,
+                Err(err) => {
+                    error!(client.http_url=?http_url, err=?err, "Error initializing Portal JSON-RPC HTTP client");
+                    return;
+                }
+            }
+        }
         TransportConfig::IPC(_path) => panic!("not implemented"),
     };
 
