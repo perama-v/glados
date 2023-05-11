@@ -1,17 +1,17 @@
+use std::collections::{HashMap, HashSet};
+use std::sync::Arc;
+use std::time::Duration as StdDuration;
+
 use anyhow::{bail, Result};
 use chrono::{DateTime, Duration, Utc};
 use clap::Parser;
 use cli::Args;
+use entity::{census, census_node, record};
 use ethereum_types::H256;
-use ethportal_api::HistoryNetworkApiClient;
-use ethportal_api::{
-    jsonrpsee::http_client::HttpClientBuilder, types::discv5::NodeId as EthPortalNodeId,
-};
+use ethportal_api::{Enr, jsonrpsee::http_client::HttpClientBuilder, HistoryNetworkApiClient, NodeId};
+use glados_core::jsonrpc::TransportConfig;
 use primitive_types::U256;
 use sea_orm::DatabaseConnection;
-use std::collections::{HashMap, HashSet};
-use std::sync::Arc;
-use std::time::Duration as StdDuration;
 use tokio::{
     sync::{
         mpsc::{self, Receiver, Sender},
@@ -20,10 +20,6 @@ use tokio::{
     time,
 };
 use tracing::{debug, error, info, warn};
-use trin_types::{enr::Enr, node_id::NodeId};
-
-use entity::{census, census_node, record};
-use glados_core::jsonrpc::TransportConfig;
 
 use crate::cli::TransportType;
 
@@ -244,10 +240,7 @@ async fn perform_dht_census(config: CartographerConfig, conn: DatabaseConnection
     );
 
     // Initialize our search with a random-ish set of ENRs
-    let initial_enrs = match client
-        .recursive_find_nodes(EthPortalNodeId(target.raw()))
-        .await
-    {
+    let initial_enrs = match client.recursive_find_nodes(NodeId(target.raw())).await {
         Ok(initial_enrs) => initial_enrs,
         Err(err) => {
             error!(target.node_id=?H256::from(target.raw()), err=?err, "Error during census initialization");
@@ -438,7 +431,7 @@ async fn do_liveliness_check(
     // Perform liviliness check
     debug!(node_id=?H256::from(enr.node_id().raw()), "Liveliness check");
 
-    match client.ping(enr.to_owned(), None).await {
+    match client.ping(enr.clone()).await {
         Ok(pong_info) => {
             debug!(node_id=?H256::from(enr.node_id().raw()), "Liveliness passed");
 
@@ -516,8 +509,8 @@ async fn do_routing_table_enumeration(
                 continue;
             }
         };
-        debug!(enr.node_id=?H256::from(enr.node_id().raw()), distance=distance, count=enrs_at_distance.enrs.len(), "Routing Table Info");
-        for found_enr in enrs_at_distance.enrs {
+        debug!(enr.node_id=?H256::from(enr.node_id().raw()), distance=distance, count=enrs_at_distance.len(), "Routing Table Info");
+        for found_enr in enrs_at_distance {
             if census.is_known(NodeId(found_enr.node_id().raw())).await {
                 continue;
             } else {
